@@ -1,286 +1,344 @@
-"""
-Adds support for the Salus Thermostat units.
-"""
-import datetime
-import time
+"""Support for Salus iT500 climate devices."""
+import asyncio
 import logging
-import re
-import requests
-import json 
 
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
-from homeassistant.components.climate.const import (
+from aiohttp import ClientResponseError
+
+from homeassistant.components.climate import (
+    ClimateEntity,
+    ClimateEntityFeature,
     HVACAction,
     HVACMode,
-    ClimateEntityFeature,
 )
-from homeassistant.const import (
-    ATTR_TEMPERATURE,
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    CONF_ID,
-    UnitOfTemperature,
-)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-try:
-    from homeassistant.components.climate import (
-        ClimateEntity,
-        PLATFORM_SCHEMA,
-    )
-except ImportError:
-    from homeassistant.components.climate import (
-        ClimateDevice as ClimateEntity,
-        PLATFORM_SCHEMA,
-    )
-
-
-from homeassistant.helpers.reload import async_setup_reload_service
-
-__version__ = "0.0.3"
-
+from . import SalusDataCoordinator
+from .const import DOMAIN
+from .pyit500.heatingzone import ConsolidatedMode, HeatingZone
+from .pyit500.zone import OnOffStatus, Prefix
+from .pyit500.device import SystemType, TemperatureUnit
 
 _LOGGER = logging.getLogger(__name__)
 
-URL_LOGIN = "https://salus-it500.com/public/login.php"
-URL_GET_TOKEN = "https://salus-it500.com/public/control.php"
-URL_GET_DATA = "https://salus-it500.com/public/ajax_device_values.php"
-URL_SET_DATA = "https://salus-it500.com/includes/set.php"
+# Preset modes mapping to ConsolidatedMode
+PRESET_AUTO = "auto"
+PRESET_MANUAL = "manual"
+PRESET_TEMP_HOLD = "temp_hold"
 
-DEFAULT_NAME = "Salus Thermostat"
+PRESET_MODES = [PRESET_AUTO, PRESET_MANUAL, PRESET_TEMP_HOLD]
+
+# Mapping between HA HVAC modes and Salus modes
+HVAC_MODE_TO_SALUS = {
+    HVACMode.OFF: ConsolidatedMode.OFF,
+    HVACMode.HEAT: ConsolidatedMode.AUTO,
+}
+
+SALUS_MODE_TO_HVAC = {
+    ConsolidatedMode.OFF: HVACMode.OFF,
+    ConsolidatedMode.AUTO: HVACMode.HEAT,
+    ConsolidatedMode.MANUAL: HVACMode.HEAT,
+    ConsolidatedMode.TEMP_HOLD: HVACMode.HEAT,
+}
+
+SALUS_MODE_TO_PRESET = {
+    ConsolidatedMode.AUTO: PRESET_AUTO,
+    ConsolidatedMode.MANUAL: PRESET_MANUAL,
+    ConsolidatedMode.TEMP_HOLD: PRESET_TEMP_HOLD,
+}
+
+PRESET_TO_SALUS_MODE = {
+    PRESET_AUTO: ConsolidatedMode.AUTO,
+    PRESET_MANUAL: ConsolidatedMode.MANUAL,
+    PRESET_TEMP_HOLD: ConsolidatedMode.TEMP_HOLD,
+}
 
 
-CONF_NAME = "name"
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Salus climate entities from a config entry."""
+    coordinator: SalusDataCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-# Values from web interface
-MIN_TEMP = 5
-MAX_TEMP = 34.5
+    entities = []
 
-SUPPORT_FLAGS = ClimateEntityFeature.TARGET_TEMPERATURE
+    # Always add CH1 (primary heating zone)
+    entities.append(SalusThermostat(coordinator, Prefix.CH1, "Heating Zone 1"))
 
-DOMAIN = "salusfy"
-PLATFORMS = ["climate"]
+    # Add CH2 if system supports it
+    if coordinator.device.system_type == SystemType.CH1_CH2:
+        entities.append(SalusThermostat(coordinator, Prefix.CH2, "Heating Zone 2"))
 
-
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Required(CONF_ID): cv.string,
-    }
-)
+    async_add_entities(entities)
 
 
-# def setup_platform(hass, config, add_entities, discovery_info=None):
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    await async_setup_reload_service(hass, DOMAIN, PLATFORMS)
-    """Set up the E-Thermostaat platform."""
-    name = config.get(CONF_NAME)
-    username = config.get(CONF_USERNAME)
-    password = config.get(CONF_PASSWORD)
-    id = config.get(CONF_ID)
+class SalusThermostat(CoordinatorEntity[SalusDataCoordinator], ClimateEntity):
+    """Representation of a Salus thermostat."""
 
-    # add_entities(
-    #     [SalusThermostat(name, username, password, id)]
-    async_add_entities(
-    [SalusThermostat(name, username, password, id)]
+    _attr_has_entity_name = False  # We set full name including device name
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     )
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
+    _attr_preset_modes = PRESET_MODES
 
-
-class SalusThermostat(ClimateEntity):
-    """Representation of a Salus Thermostat device."""
-
-    def __init__(self, name, username, password, id):
+    def __init__(
+        self,
+        coordinator: SalusDataCoordinator,
+        zone_prefix: Prefix,
+        name: str,
+    ) -> None:
         """Initialize the thermostat."""
-        self._name = name
-        self._username = username
-        self._password = password
-        self._id = id
-        self._current_temperature = None
-        self._target_temperature = None
-        self._frost = None
-        self._status = None
-        self._current_operation_mode = None
-        self._token = None
+        super().__init__(coordinator)
+        self._zone_prefix = zone_prefix
         
-        self._session = requests.Session()
-        
-        
-        self.update()
-    
-    @property
-    def supported_features(self):
-        """Return the list of supported features."""
-        return SUPPORT_FLAGS
+        # Optimistic state for immediate UI updates
+        self._optimistic_target_temp = None
+        self._optimistic_hvac_mode = None
+        self._optimistic_preset_mode = None
+
+        # Set temperature unit based on device configuration
+        if coordinator.device.temperature_unit == TemperatureUnit.FAHRENHEIT:
+            self._attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
+        else:
+            self._attr_temperature_unit = UnitOfTemperature.CELSIUS
+
+        # Use device name as prefix for entity name
+        device_name = coordinator.device.description or "Salus iT500"
+        self._attr_name = f"{device_name} {name}"
+        self._attr_unique_id = (
+            f"{coordinator.device.device_id}_{zone_prefix.value}_climate"
+        )
 
     @property
-    def name(self):
-        """Return the name of the thermostat."""
-        return self._name
-        
-    @property
-    def unique_id(self) -> str:
-        """Return the unique ID for this thermostat."""
-        return "_".join([self._name, "climate"])
+    def _zone(self) -> HeatingZone:
+        """Return the heating zone for this thermostat."""
+        if self._zone_prefix == Prefix.CH1:
+            return self.coordinator.device.ch1
+        return self.coordinator.device.ch2
 
     @property
-    def should_poll(self):
-        """Return if polling is required."""
-        return True
-
-    @property
-    def min_temp(self):
-        """Return the minimum temperature."""
-        return MIN_TEMP
-
-    @property
-    def max_temp(self):
-        """Return the maximum temperature."""
-        return MAX_TEMP
-
-    @property
-    def temperature_unit(self):
-        """Return the unit of measurement."""
-        return UnitOfTemperature.CELSIUS
-
-    @property
-    def current_temperature(self):
+    def current_temperature(self) -> float | None:
         """Return the current temperature."""
-        return self._current_temperature
+        return self._zone.current_room_temp
 
     @property
-    def target_temperature(self):
+    def target_temperature(self) -> float | None:
         """Return the temperature we try to reach."""
-        return self._target_temperature
-
-
-    @property
-    def hvac_mode(self):
-        """Return hvac operation ie. heat, cool mode."""
-        try:
-            climate_mode = self._current_operation_mode
-            curr_hvac_mode = HVACMode.OFF
-            if climate_mode == "ON":
-                curr_hvac_mode = HVACMode.HEAT
-            else:
-                curr_hvac_mode = HVACMode.OFF
-        except KeyError:
-            return HVACMode.OFF
-        return curr_hvac_mode
-        
-    @property
-    def hvac_modes(self):
-        """HVAC modes."""
-        return [HVACMode.HEAT, HVACMode.OFF]
+        # Use optimistic value if available, otherwise use actual value
+        if self._optimistic_target_temp is not None:
+            return self._optimistic_target_temp
+        return self._zone.current_setpoint
 
     @property
-    def hvac_action(self):
+    def hvac_mode(self) -> HVACMode:
+        """Return hvac operation mode."""
+        # Use optimistic value if available, otherwise use actual value
+        if self._optimistic_hvac_mode is not None:
+            return self._optimistic_hvac_mode
+        mode = self._zone.consolidated_mode
+        return SALUS_MODE_TO_HVAC.get(mode, HVACMode.OFF)
+
+    @property
+    def hvac_action(self) -> HVACAction:
         """Return the current running hvac operation."""
-        if self._status == "ON":
+        if self._zone.relay_status == OnOffStatus.ON:
             return HVACAction.HEATING
+        if self._zone.consolidated_mode == ConsolidatedMode.OFF:
+            return HVACAction.OFF
         return HVACAction.IDLE
-        
 
     @property
-    def preset_mode(self):
-        """Return the current preset mode, e.g., home, away, temp."""
-        return self._status
-        
+    def preset_mode(self) -> str | None:
+        """Return the current preset mode."""
+        # Use optimistic value if available, otherwise use actual value
+        if self._optimistic_preset_mode is not None:
+            return self._optimistic_preset_mode
+        mode = self._zone.consolidated_mode
+        return SALUS_MODE_TO_PRESET.get(mode)
+
     @property
-    def preset_modes(self):
-        """Return a list of available preset modes."""
-        return SUPPORT_PRESET
-        
-        
-    def set_temperature(self, **kwargs):
+    def min_temp(self) -> float:
+        """Return the minimum temperature."""
+        if self._attr_temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            return 41.0  # 5°C in Fahrenheit
+        return 5.0
+
+    @property
+    def max_temp(self) -> float:
+        """Return the maximum temperature."""
+        if self._attr_temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            return 95.0  # 35°C = 95°F
+        return 35.0
+
+    async def async_set_temperature(self, **kwargs) -> None:
         """Set new target temperature."""
-        temperature = kwargs.get(ATTR_TEMPERATURE)
-        if temperature is None:
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
-        self._set_temperature(temperature)
 
-    def _set_temperature(self, temperature):
-        """Set new target temperature, via URL commands."""
-        payload = {"token": self._token, "devId": self._id, "tempUnit": "0", "current_tempZ1_set": "1", "current_tempZ1": temperature}
-        headers = {"content-type": "application/x-www-form-urlencoded"}
-        try:
-            if self._session.post(URL_SET_DATA, data=payload, headers=headers):
-                self._target_temperature = temperature
-                # self.schedule_update_ha_state(force_refresh=True)
-            _LOGGER.info("Salusfy set_temperature OK")
-        except:
-            _LOGGER.error("Error Setting the temperature.")
+        # Set optimistic state for immediate UI feedback
+        self._optimistic_target_temp = temperature
+        self.async_write_ha_state()
 
-    def set_hvac_mode(self, hvac_mode):
-        """Set HVAC mode, via URL commands."""
-        
-        headers = {"content-type": "application/x-www-form-urlencoded"}
-        if hvac_mode == HVACMode.OFF:
-            payload = {"token": self._token, "devId": self._id, "auto": "1", "auto_setZ1": "1"}
-            try:
-                if self._session.post(URL_SET_DATA, data=payload, headers=headers):
-                    self._current_operation_mode = "OFF"
-            except:
-                _LOGGER.error("Error Setting HVAC mode OFF.")
-        elif hvac_mode == HVACMode.HEAT:
-            payload = {"token": self._token, "devId": self._id, "auto": "0", "auto_setZ1": "1"}
-            try:
-                if self._session.post(URL_SET_DATA, data=payload, headers=headers):
-                    self._current_operation_mode = "ON"
-            except:
-                _LOGGER.error("Error Setting HVAC mode.")
-        _LOGGER.info("Setting the HVAC mode.")
-            
-    def get_token(self):
-        """Get the Session Token of the Thermostat."""
-        payload = {"IDemail": self._username, "password": self._password, "login": "Login", "keep_logged_in": "1"}
-        headers = {"content-type": "application/x-www-form-urlencoded"}
+        # Retry logic for transient API errors
+        max_retries = 3
+        retry_delays = [1, 2, 4]  # Exponential backoff
         
         try:
-            self._session.post(URL_LOGIN, data=payload, headers=headers)
-            params = {"devId": self._id}
-            getTkoken = self._session.get(URL_GET_TOKEN,params=params)
-            result = re.search('<input id="token" type="hidden" value="(.*)" />', getTkoken.text)
-            _LOGGER.info("Salusfy get_token OK")
-            self._token = result.group(1)
-        except:
-            _LOGGER.error("Error Geting the Session Token.")
+            for attempt in range(max_retries):
+                try:
+                    await self._zone.async_set_current_setpoint(temperature)
+                    await self.coordinator.async_request_refresh()
+                    return  # Success
+                except ClientResponseError as err:
+                    if err.status in (500, 502, 503, 504) and attempt < max_retries - 1:
+                        # Transient server error, retry
+                        delay = retry_delays[attempt]
+                        _LOGGER.warning(
+                            "API error setting temperature (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            err,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Non-retryable error or final attempt
+                        _LOGGER.error(
+                            "Failed to set temperature to %s: API returned %s - %s",
+                            temperature,
+                            err.status,
+                            err.message,
+                        )
+                        raise HomeAssistantError(
+                            f"Failed to set temperature: API error {err.status}"
+                        ) from err
+        finally:
+            # Clear optimistic state after all attempts complete
+            self._optimistic_target_temp = None
 
-    def _get_data(self):
-        if self._token is None:
-            self.get_token()
-        params = {"devId": self._id, "token": self._token, "&_": str(int(round(time.time() * 1000)))}
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target hvac mode."""
+        if hvac_mode not in HVAC_MODE_TO_SALUS:
+            _LOGGER.error("Unsupported HVAC mode: %s", hvac_mode)
+            return
+
+        # Set optimistic state for immediate UI feedback
+        self._optimistic_hvac_mode = hvac_mode
+        salus_mode = HVAC_MODE_TO_SALUS[hvac_mode]
+        # Also set preset mode optimistically
+        self._optimistic_preset_mode = SALUS_MODE_TO_PRESET.get(salus_mode)
+        self.async_write_ha_state()
+
+        # Retry logic for transient API errors
+        max_retries = 3
+        retry_delays = [1, 2, 4]  # Exponential backoff
+        
         try:
-            r = self._session.get(url = URL_GET_DATA, params = params)
-            try:
-                if r:
-                    data = json.loads(r.text)
-                    _LOGGER.info("Salusfy get_data output OK")
-                    self._target_temperature = float(data["CH1currentSetPoint"])
-                    self._current_temperature = float(data["CH1currentRoomTemp"])
-                    self._frost = float(data["frost"])
-                    
-                    status = data['CH1heatOnOffStatus']
-                    if status == "1":
-                      self._status = "ON"
+            for attempt in range(max_retries):
+                try:
+                    await self._zone.async_set_consolidated_mode(salus_mode)
+                    await self.coordinator.async_request_refresh()
+                    return  # Success
+                except ClientResponseError as err:
+                    if err.status in (500, 502, 503, 504) and attempt < max_retries - 1:
+                        # Transient server error, retry
+                        delay = retry_delays[attempt]
+                        _LOGGER.warning(
+                            "API error setting HVAC mode (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            err,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                     else:
-                      self._status = "OFF"
-                    mode = data['CH1heatOnOff']
-                    if mode == "1":
-                      self._current_operation_mode = "OFF"
+                        # Non-retryable error or final attempt
+                        _LOGGER.error(
+                            "Failed to set HVAC mode to %s: API returned %s - %s",
+                            hvac_mode,
+                            err.status,
+                            err.message,
+                        )
+                        raise HomeAssistantError(
+                            f"Failed to set HVAC mode: API error {err.status}"
+                        ) from err
+        finally:
+            # Clear optimistic state after all attempts complete
+            self._optimistic_hvac_mode = None
+            self._optimistic_preset_mode = None
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        if preset_mode not in PRESET_TO_SALUS_MODE:
+            _LOGGER.error("Unsupported preset mode: %s", preset_mode)
+            return
+
+        # Set optimistic state for immediate UI feedback
+        self._optimistic_preset_mode = preset_mode
+        self.async_write_ha_state()
+
+        salus_mode = PRESET_TO_SALUS_MODE[preset_mode]
+        current_mode = self._zone.consolidated_mode
+
+        # Retry logic for transient API errors
+        max_retries = 3
+        retry_delays = [1, 2, 4]  # Exponential backoff
+        
+        try:
+            for attempt in range(max_retries):
+                try:
+                    # Workaround for Salus API quirk: Direct TEMP_HOLD → AUTO transition doesn't stick
+                    # Need to go through MANUAL mode first to clear the temp_hold state
+                    if current_mode == ConsolidatedMode.TEMP_HOLD and salus_mode == ConsolidatedMode.AUTO:
+                        _LOGGER.debug("Switching from TEMP_HOLD to AUTO via MANUAL mode")
+                        await self._zone.async_set_consolidated_mode(ConsolidatedMode.MANUAL)
+                        # Small delay to let API process the manual mode change
+                        await asyncio.sleep(0.5)
+
+                    await self._zone.async_set_consolidated_mode(salus_mode)
+                    await self.coordinator.async_request_refresh()
+                    return  # Success
+                except ClientResponseError as err:
+                    if err.status in (500, 502, 503, 504) and attempt < max_retries - 1:
+                        # Transient server error, retry
+                        delay = retry_delays[attempt]
+                        _LOGGER.warning(
+                            "API error setting preset mode (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            err,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                     else:
-                      self._current_operation_mode = "ON"
-                else:
-                    _LOGGER.error("Could not get data from Salus.")
-            except:
-                self.get_token()
-                self._get_data()
-        except:
-            _LOGGER.error("Error Geting the data from Web. Please check the connection to salus-it500.com manually.")
+                        # Non-retryable error or final attempt
+                        _LOGGER.error(
+                            "Failed to set preset mode to %s: API returned %s - %s",
+                            preset_mode,
+                            err.status,
+                            err.message,
+                        )
+                        raise HomeAssistantError(
+                            f"Failed to set preset mode: API error {err.status}"
+                        ) from err
+        finally:
+            # Clear optimistic state after all attempts complete
+            self._optimistic_preset_mode = None
 
-    def update(self):
-        """Get the latest data."""
-        self._get_data()
-
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return additional state attributes."""
+        return {
+            "frost_active": self._zone.frost_active.friendly_name,
+            "schedule_type": self._zone.schedule_type.friendly_name,
+        }

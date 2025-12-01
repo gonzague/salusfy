@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Salus iT500 Setup",
+        "description": "Enter your Salus iT500 credentials",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Salus API",
+      "invalid_auth": "Invalid authentication credentials",
+      "no_devices": "No devices found for this account",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "Account is already configured"
+    }
+  },
+  "entity": {
+    "water_heater": {
+      "salusfy": {
+        "state": {
+          "auto": "Auto",
+          "boost": "Boost",
+          "on": "Always On",
+          "off": "Off"
+        }
+      }
+    },
+    "climate": {
+      "salusfy": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "auto": "Auto",
+              "manual": "Manual",
+              "temp_hold": "Temporary Hold"
+            }
+          }
+        }
+      }
+    }
+  }
+}

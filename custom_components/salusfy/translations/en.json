@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Salus iT500 Setup",
+        "description": "Enter your Salus iT500 credentials",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Salus API",
+      "invalid_auth": "Invalid authentication credentials",
+      "no_devices": "No devices found for this account",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "Account is already configured"
+    }
+  }
+}

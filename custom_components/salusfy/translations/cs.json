@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Nastavení Salus iT500",
+        "description": "Zadejte přihlašovací údaje k Salus iT500",
+        "data": {
+          "username": "Email",
+          "password": "Heslo"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Nepodařilo se připojit k Salus API",
+      "invalid_auth": "Neplatné přihlašovací údaje",
+      "no_devices": "Pro tento účet nebyla nalezena žádná zařízení",
+      "unknown": "Došlo k neočekávané chybě"
+    },
+    "abort": {
+      "already_configured": "Účet je již nakonfigurován"
+    }
+  },
+  "entity": {
+    "water_heater": {
+      "salusfy": {
+        "state": {
+          "auto": "Automatický",
+          "boost": "Boost",
+          "on": "Trvale zapnuto",
+          "off": "Vypnuto"
+        }
+      }
+    },
+    "climate": {
+      "salusfy": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "auto": "Automatický",
+              "manual": "Manuální",
+              "temp_hold": "Dočasné přidržení"
+            }
+          }
+        }
+      }
+    }
+  }
+}
